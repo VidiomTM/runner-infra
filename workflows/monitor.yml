@@ -27,14 +27,14 @@ jobs:
             // Prefer PAT (org:admin) for full visibility. Fall back to GITHUB_TOKEN
             // which can only see runners assigned to runner-infra's repo group.
             const token = process.env.RUNNER_MONITOR_TOKEN || process.env.GITHUB_TOKEN;
-            const octokit = github.getOctokit(token);
+            const gh = github.getOctokit(token);
 
             let runners = [];
             let usingFallback = false;
 
             try {
-              runners = await octokit.paginate(
-                octokit.rest.actions.listSelfHostedRunnersForOrg,
+              runners = await gh.paginate(
+                gh.rest.actions.listSelfHostedRunnersForOrg,
                 { org, per_page: 100 }
               );
             } catch (err) {
@@ -42,8 +42,8 @@ jobs:
                 core.warning(`Cannot list org runners (status ${err.status}). Falling back to repo-level listing.`);
                 usingFallback = true;
                 try {
-                  runners = await octokit.paginate(
-                    octokit.rest.actions.listSelfHostedRunnersForRepo,
+                  runners = await gh.paginate(
+                    gh.rest.actions.listSelfHostedRunnersForRepo,
                     { owner: org, repo: monitorRepo, per_page: 100 }
                   );
                 } catch (err2) {
