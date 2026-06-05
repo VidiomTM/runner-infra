@@ -7,23 +7,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  organization: admin
   contents: read
+  issues: write
 
 jobs:
   health:
     name: Health Check
     runs-on: ubuntu-latest
     steps:
-      - name: List runners
-        id: list
+      - name: List runners and alert on capacity drop
         uses: actions/github-script@v7
         with:
           script: |
-            const org = '${{ vars.ORG_NAME || 'VidiomTM' }}';
-            const expected = Number('${{ vars.EXPECTED_RUNNERS || 5 }}');
-            const minAvailable = Number('${{ vars.MIN_AVAILABLE || 3 }}');
+            const org = process.env.ORG_NAME || 'VidiomTM';
+            const expected = Number(process.env.EXPECTED_RUNNERS || 5);
+            const minAvailable = Number(process.env.MIN_AVAILABLE || 3);
+            const monitorRepo = process.env.MONITOR_REPO || 'runner-infra';
 
+            // List org runners (requires token with org:admin scope)
             const runners = await github.paginate(
               github.rest.actions.listSelfHostedRunnersForOrg,
               { org, per_page: 100 }
@@ -44,18 +45,18 @@ jobs:
               minAvailable,
             };
 
-            console.log('=== Runner Health ===');
-            console.log(`Total registered: ${summary.total}`);
-            console.log(`Online: ${summary.online} (busy=${summary.busy}, idle=${summary.idle})`);
-            console.log(`Offline: ${summary.offline}`);
-            console.log(`Expected online: ${summary.expected}`);
+            core.info('=== Runner Health ===');
+            core.info(`Total registered: ${summary.total}`);
+            core.info(`Online: ${summary.online} (busy=${summary.busy}, idle=${summary.idle})`);
+            core.info(`Offline: ${summary.offline}`);
+            core.info(`Expected online: ${summary.expected}`);
 
             const lines = [];
             for (const r of runners) {
-              const status = r.status === 'online' ? (r.busy ? '🟡 busy' : '🟢 idle') : '🔴 offline';
-              lines.push(`  ${status}  ${r.name}  (${r.os})`);
+              const status = r.status === 'online' ? (r.busy ? 'busy' : 'idle') : 'OFFLINE';
+              lines.push(`  [${status}] ${r.name} (${r.os})`);
             }
-            console.log(lines.join('\n'));
+            core.info(lines.join('\n'));
 
             const issues = [];
             if (summary.online < expected) {
@@ -66,37 +67,63 @@ jobs:
             }
 
             if (issues.length > 0) {
-              const body = [
-                '## ⚠️ Runner Capacity Issue',
-                '',
-                ...issues,
-                '',
-                '### Current State',
-                `- Online: ${summary.online} / ${summary.expected} expected`,
-                `- Busy: ${summary.busy}`,
-                `- Idle: ${summary.idle}`,
-                `- Offline: ${summary.offline}`,
-                '',
-                '### Runners',
-                ...lines,
-                '',
-                '### Remediation',
-                '1. Check the runner hosts (ssh into the Mac)',
-                '2. Verify launchd plists are loaded: `launchctl list | grep vidiomtm`',
-                '3. Check logs: `tail -f ~/runners/mac-ci-N/runner.log`',
-                '4. If a runner is permanently down, re-register: `REGISTRATION_TOKEN=... ./scripts/bootstrap.sh ~/runners/mac-ci-N mac-ci-N`',
-                '5. If a runner is stuck busy, the [runner-hygiene](https://github.com/VidiomTM/runner-hygiene) workflow will clean it within 15 minutes',
-              ].join('\n');
-
-              await github.rest.issues.create({
+              // Check if there's already an open alert issue — don't spam
+              const { data: openIssues } = await github.rest.issues.listForRepo({
                 owner: org,
-                repo: '${{ vars.MONITOR_REPO || 'runner-infra' }}',
-                title: `Runner capacity alert: ${summary.online}/${summary.expected} online`,
-                body,
-                labels: ['ci', 'runners', 'infrastructure'],
+                repo: monitorRepo,
+                state: 'open',
+                labels: 'runners,infrastructure',
               });
 
+              const hasOpenAlert = openIssues.some(i => i.title.startsWith('Runner capacity alert'));
+
+              if (!hasOpenAlert) {
+                const body = [
+                  '## ⚠️ Runner Capacity Issue',
+                  '',
+                  ...issues,
+                  '',
+                  '### Current State',
+                  `- Online: ${summary.online} / ${summary.expected} expected`,
+                  `- Busy: ${summary.busy}`,
+                  `- Idle: ${summary.idle}`,
+                  `- Offline: ${summary.offline}`,
+                  '',
+                  '### Runners',
+                  ...lines,
+                  '',
+                  '### Remediation',
+                  '1. SSH into the Mac host',
+                  '2. Check launchd status: `launchctl list | grep vidiomtm`',
+                  '3. Check logs: `tail -100 ~/runners/mac-ci-N/runner.log`',
+                  '4. Force restart: `launchctl kickstart -k gui/$(id -u)/com.vidiomtm.runner.mac-ci-N`',
+                  '5. If permanently down, re-register using [runner-infra/scripts/bootstrap.sh](https://github.com/VidiomTM/runner-infra/blob/main/scripts/bootstrap.sh)',
+                  '6. Stuck-busy runners are auto-cleaned every 15 min by [runner-hygiene](https://github.com/VidiomTM/runner-hygiene)',
+                  '',
+                  '---',
+                  `Auto-generated by runner-monitor workflow run #${context.runNumber}`,
+                ].join('\n');
+
+                await github.rest.issues.create({
+                  owner: org,
+                  repo: monitorRepo,
+                  title: `Runner capacity alert: ${summary.online}/${summary.expected} online`,
+                  body,
+                  labels: ['runners', 'infrastructure'],
+                });
+
+                core.warning(`Created alert issue. Issues: ${issues.join('; ')}`);
+              } else {
+                core.info('Open alert issue already exists, not creating a duplicate');
+              }
+
               core.setFailed(issues.join('; '));
+            } else {
+              core.info('All checks passed');
             }
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          ORG_NAME: ${{ vars.ORG_NAME }}
+          EXPECTED_RUNNERS: ${{ vars.EXPECTED_RUNNERS }}
+          MIN_AVAILABLE: ${{ vars.MIN_AVAILABLE }}
+          MONITOR_REPO: ${{ vars.MONITOR_REPO }}
+          GH_TOKEN: ${{ secrets.RUNNER_MONITOR_TOKEN }}
