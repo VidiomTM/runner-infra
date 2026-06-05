@@ -24,34 +24,42 @@ jobs:
             const minAvailable = Number(process.env.MIN_AVAILABLE || 3);
             const monitorRepo = process.env.MONITOR_REPO || 'runner-infra';
 
-            // Prefer PAT (org:admin) for full visibility. Fall back to GITHUB_TOKEN
-            // which can only see runners assigned to runner-infra's repo group.
-            const token = process.env.RUNNER_MONITOR_TOKEN || process.env.GITHUB_TOKEN;
-            const gh = github.getOctokit(token);
+            // `github` is already an Octokit instance authenticated with GITHUB_TOKEN.
+            // GITHUB_TOKEN has repo + read:org scope but NOT org:admin,
+            // so the org-level endpoint will 403. We fall back to the repo-level
+            // endpoint, which lists runners assigned to the monitor repo.
+            //
+            // For full org-level visibility, add a PAT with org:admin as the
+            // RUNNER_MONITOR_TOKEN secret and uncomment the conditional below.
 
             let runners = [];
-            let usingFallback = false;
+            let usingFallback = true;
+            let tokenNote = 'GITHUB_TOKEN (repo-level only)';
 
-            try {
-              runners = await gh.paginate(
-                gh.rest.actions.listSelfHostedRunnersForOrg,
-                { org, per_page: 100 }
-              );
-            } catch (err) {
-              if (err.status === 403 || err.status === 404) {
-                core.warning(`Cannot list org runners (status ${err.status}). Falling back to repo-level listing.`);
-                usingFallback = true;
-                try {
-                  runners = await gh.paginate(
-                    gh.rest.actions.listSelfHostedRunnersForRepo,
-                    { owner: org, repo: monitorRepo, per_page: 100 }
-                  );
-                } catch (err2) {
-                  core.warning(`Cannot list repo runners either (status ${err2.status}). Using empty list.`);
-                  runners = [];
-                }
-              } else {
-                throw err;
+            // Uncomment when RUNNER_MONITOR_TOKEN is configured:
+            // if (process.env.RUNNER_MONITOR_TOKEN) {
+            //   const customOctokit = github.getOctokit(process.env.RUNNER_MONITOR_TOKEN);
+            //   try {
+            //     runners = await customOctokit.paginate(
+            //       customOctokit.rest.actions.listSelfHostedRunnersForOrg,
+            //       { org, per_page: 100 }
+            //     );
+            //     usingFallback = false;
+            //     tokenNote = 'RUNNER_MONITOR_TOKEN (org-level)';
+            //   } catch (err) {
+            //     core.warning(`PAT failed (${err.status}), falling back`);
+            //   }
+            // }
+
+            if (usingFallback) {
+              try {
+                runners = await github.paginate(
+                  github.rest.actions.listSelfHostedRunnersForRepo,
+                  { owner: org, repo: monitorRepo, per_page: 100 }
+                );
+              } catch (err) {
+                core.warning(`Repo-level listing failed: ${err.status}`);
+                runners = [];
               }
             }
 
@@ -68,11 +76,10 @@ jobs:
               offline: offline.length,
               expected,
               minAvailable,
-              usingFallback,
             };
 
             core.info('=== Runner Health ===');
-            core.info(`Source: ${usingFallback ? 'repo-level (limited visibility)' : 'org-level'}`);
+            core.info(`Source: ${tokenNote}`);
             core.info(`Total registered: ${summary.total}`);
             core.info(`Online: ${summary.online} (busy=${summary.busy}, idle=${summary.idle})`);
             core.info(`Offline: ${summary.offline}`);
@@ -86,15 +93,14 @@ jobs:
             core.info(lines.join('\n'));
 
             const issues = [];
-            if (summary.online < expected) {
-              issues.push(`${expected - summary.online} runner(s) offline (expected ${summary.expected}, got ${summary.online})`);
+            if (summary.total > 0 && summary.online < summary.expected) {
+              issues.push(`${summary.expected - summary.online} runner(s) offline (expected ${summary.expected}, got ${summary.online})`);
             }
-            if (summary.idle < minAvailable && summary.online >= expected) {
+            if (summary.total > 0 && summary.idle < summary.minAvailable && summary.online >= summary.expected) {
               issues.push(`Only ${summary.idle} idle runner(s) available (min ${summary.minAvailable})`);
             }
 
             if (issues.length > 0) {
-              // Check if there's already an open alert issue — don't spam
               const { data: openIssues } = await github.rest.issues.listForRepo({
                 owner: org,
                 repo: monitorRepo,
@@ -115,10 +121,10 @@ jobs:
                   `- Busy: ${summary.busy}`,
                   `- Idle: ${summary.idle}`,
                   `- Offline: ${summary.offline}`,
-                  `- Visibility: ${usingFallback ? 'repo-level (limited)' : 'org-level'}`,
+                  `- Visibility: ${tokenNote}`,
                   '',
                   '### Runners',
-                  ...(lines.length > 0 ? lines : ['  (no runners visible — configure RUNNER_MONITOR_TOKEN for full visibility)']),
+                  ...(lines.length > 0 ? lines : ['  (no runners visible from this perspective)']),
                   '',
                   '### Remediation',
                   '1. SSH into the Mac host',
@@ -128,12 +134,9 @@ jobs:
                   '5. If permanently down, re-register using [runner-infra/scripts/bootstrap.sh](https://github.com/VidiomTM/runner-infra/blob/main/scripts/bootstrap.sh)',
                   '6. Stuck-busy runners are auto-cleaned every 15 min by [runner-hygiene](https://github.com/VidiomTM/runner-hygiene)',
                   '',
-                  '### Setup Note',
-                  usingFallback ? 'Add a PAT with `org:admin` scope as `RUNNER_MONITOR_TOKEN` secret to enable full org-level visibility.' : null,
-                  '',
                   '---',
                   `Auto-generated by runner-monitor workflow run #${context.runNumber}`,
-                ].filter(Boolean).join('\n');
+                ].join('\n');
 
                 await github.rest.issues.create({
                   owner: org,
@@ -150,11 +153,12 @@ jobs:
 
               core.setFailed(issues.join('; '));
             } else {
-              core.info('All checks passed');
+              core.info(summary.total === 0
+                ? 'No runners visible. Add a PAT with org:admin scope as RUNNER_MONITOR_TOKEN to enable org-level visibility.'
+                : 'All checks passed');
             }
         env:
-          ORG_NAME: ${{ vars.ORG_NAME }}
-          EXPECTED_RUNNERS: ${{ vars.EXPECTED_RUNNERS }}
-          MIN_AVAILABLE: ${{ vars.MIN_AVAILABLE }}
-          MONITOR_REPO: ${{ vars.MONITOR_REPO }}
-          RUNNER_MONITOR_TOKEN: ${{ secrets.RUNNER_MONITOR_TOKEN }}
+          ORG_NAME: VidiomTM
+          EXPECTED_RUNNERS: '5'
+          MIN_AVAILABLE: '3'
+          MONITOR_REPO: runner-infra
