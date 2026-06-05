@@ -1,0 +1,102 @@
+name: Runner Monitor
+
+on:
+  schedule:
+    # Every 5 minutes
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  organization: admin
+  contents: read
+
+jobs:
+  health:
+    name: Health Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: List runners
+        id: list
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const org = '${{ vars.ORG_NAME || 'VidiomTM' }}';
+            const expected = Number('${{ vars.EXPECTED_RUNNERS || 5 }}');
+            const minAvailable = Number('${{ vars.MIN_AVAILABLE || 3 }}');
+
+            const runners = await github.paginate(
+              github.rest.actions.listSelfHostedRunnersForOrg,
+              { org, per_page: 100 }
+            );
+
+            const online = runners.filter(r => r.status === 'online');
+            const busy = online.filter(r => r.busy);
+            const idle = online.filter(r => !r.busy);
+            const offline = runners.filter(r => r.status === 'offline');
+
+            const summary = {
+              total: runners.length,
+              online: online.length,
+              busy: busy.length,
+              idle: idle.length,
+              offline: offline.length,
+              expected,
+              minAvailable,
+            };
+
+            console.log('=== Runner Health ===');
+            console.log(`Total registered: ${summary.total}`);
+            console.log(`Online: ${summary.online} (busy=${summary.busy}, idle=${summary.idle})`);
+            console.log(`Offline: ${summary.offline}`);
+            console.log(`Expected online: ${summary.expected}`);
+
+            const lines = [];
+            for (const r of runners) {
+              const status = r.status === 'online' ? (r.busy ? '🟡 busy' : '🟢 idle') : '🔴 offline';
+              lines.push(`  ${status}  ${r.name}  (${r.os})`);
+            }
+            console.log(lines.join('\n'));
+
+            const issues = [];
+            if (summary.online < expected) {
+              issues.push(`${expected - summary.online} runner(s) offline (expected ${expected}, got ${summary.online})`);
+            }
+            if (summary.idle < minAvailable) {
+              issues.push(`Only ${summary.idle} idle runner(s) available (min ${minAvailable})`);
+            }
+
+            if (issues.length > 0) {
+              const body = [
+                '## ⚠️ Runner Capacity Issue',
+                '',
+                ...issues,
+                '',
+                '### Current State',
+                `- Online: ${summary.online} / ${summary.expected} expected`,
+                `- Busy: ${summary.busy}`,
+                `- Idle: ${summary.idle}`,
+                `- Offline: ${summary.offline}`,
+                '',
+                '### Runners',
+                ...lines,
+                '',
+                '### Remediation',
+                '1. Check the runner hosts (ssh into the Mac)',
+                '2. Verify launchd plists are loaded: `launchctl list | grep vidiomtm`',
+                '3. Check logs: `tail -f ~/runners/mac-ci-N/runner.log`',
+                '4. If a runner is permanently down, re-register: `REGISTRATION_TOKEN=... ./scripts/bootstrap.sh ~/runners/mac-ci-N mac-ci-N`',
+                '5. If a runner is stuck busy, the [runner-hygiene](https://github.com/VidiomTM/runner-hygiene) workflow will clean it within 15 minutes',
+              ].join('\n');
+
+              await github.rest.issues.create({
+                owner: org,
+                repo: '${{ vars.MONITOR_REPO || 'runner-infra' }}',
+                title: `Runner capacity alert: ${summary.online}/${summary.expected} online`,
+                body,
+                labels: ['ci', 'runners', 'infrastructure'],
+              });
+
+              core.setFailed(issues.join('; '));
+            }
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
